@@ -39,6 +39,121 @@ class ModelConfig:
     n_head: int = 4
 
 # -----------------------------------------------------------------------------
+# Transformer Language Model (*exactly* as used in GPT-2)
+
+class NewGELU(nn.Module):
+    """
+    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+class CausalSelfAttention(nn.Module):
+    """
+    A vanilla multi-head masked self-attention layer with a projection at the end.
+    Similar to torch.nn.MultiheadAttention.
+    """
+    def __init__(self,config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+    
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) 
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side (concatenation)
+
+        # output projection
+        y = self.c_proj(y)
+        return y
+
+class Block(nn.Module):
+    """ Transformer block """
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = nn.ModuleDict(dict(
+            c_fc = nn.Linear(config.n_embd, 4 * config.n_embd),
+            c_proj = nn.Linear(4 * config.n_embd, config.n_embd),
+            act_fct = NewGELU(),
+        ))
+        mlp = self.mlp
+        self.mlpf = lambda x : mlp.c_proj(mlp.act_fct(mlp.c_fc(x))) # MLP forward pass
+    
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlpf(self.ln_2(x))
+        return x
+    
+class Transformer(nn.Module):
+    """ Transformer Language Model, exactly as seen in GPT-2 """
+
+    def __init__(self,config):
+        super().__init__()
+        self.block_size = config.block_size
+    
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # report number of parameters (note we don't count the decoder parameters in lm_head)
+        n_params = sum(p.numel() for p in self.transformer.parameters())
+        print("number of parameters: %.2fM" % (n_params/1e6,))
+    
+    def get_block_size(self):
+        return self.block_size
+    
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1,t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = tok_emb + pos_emb
+
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+
+        # if we are given some desired targets also calculate the loss
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+        return logits, loss
+
+# -----------------------------------------------------------------------------
 # Bag of Words (BoW) language model
 
 class CausalBoW(nn.Module):
@@ -424,34 +539,34 @@ class CharDataset(Dataset):
         y[len(ix)+1:] = -1 # index -1 will mask the loss at the inactive locations
         return x, y
     
-    def create_datasets(input_file):
+def create_datasets(input_file):
 
-        # preprocessing of the input text file
-        with open(input_file, 'r') as f:
-            data = f.read()
-        words = data.splitlines()
-        words = [w.strip() for w in words] # get rid of any leading or trailing white space
-        words = [w for w in words if w] # get rid of any empty strings
-        chars = sorted(list(set(''.join(words)))) # all the possible characters
-        max_word_length = max(len(w) for w in words)
-        print(f"number of examples in the dataset: {len(words)}")
-        print(f"max word length: {max_word_length}")
-        print(f"number of unique characters in the vocabulary: {len(chars)}")
-        print("vocabulary:")
-        print(''.join(chars))
+    # preprocessing of the input text file
+    with open(input_file, 'r') as f:
+        data = f.read()
+    words = data.splitlines()
+    words = [w.strip() for w in words] # get rid of any leading or trailing white space
+    words = [w for w in words if w] # get rid of any empty strings
+    chars = sorted(list(set(''.join(words)))) # all the possible characters
+    max_word_length = max(len(w) for w in words)
+    print(f"number of examples in the dataset: {len(words)}")
+    print(f"max word length: {max_word_length}")
+    print(f"number of unique characters in the vocabulary: {len(chars)}")
+    print("vocabulary:")
+    print(''.join(chars))
 
-        # partition the input data into a training and the test set
-        test_set_size = min(1000, int(len(words) * 0.1)) # 10% of the training set, or up to 1000 examples
-        rp = torch.randperm(len(words)).tolist()
-        train_words = [words[i] for i in rp[:-test_set_size]]
-        test_words = [words[i] for i in rp[-test_set_size:]]
-        print(f"split up the dataset into {len(train_words)} training examples and {len(test_words)} test examples")
+    # partition the input data into a training and the test set
+    test_set_size = min(1000, int(len(words) * 0.1)) # 10% of the training set, or up to 1000 examples
+    rp = torch.randperm(len(words)).tolist()
+    train_words = [words[i] for i in rp[:-test_set_size]]
+    test_words = [words[i] for i in rp[-test_set_size:]]
+    print(f"split up the dataset into {len(train_words)} training examples and {len(test_words)} test examples")
 
-        # wrap in dataset objects
-        train_dataset = CharDataset(train_words, chars, max_word_length)
-        test_dataset = CharDataset(test_words, chars, max_word_length)
+    # wrap in dataset objects
+    train_dataset = CharDataset(train_words, chars, max_word_length)
+    test_dataset = CharDataset(test_words, chars, max_word_length)
 
-        return train_dataset, test_dataset
+    return train_dataset, test_dataset
 
 class InfiniteDataLoader:
     """
